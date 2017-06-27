@@ -253,6 +253,9 @@ bool gvr_get_async_reprojection_enabled(const gvr_context* gvr);
 /// will ensure that the populated viewports reflect the currently paired
 /// viewer.
 ///
+/// This function assumes that the client is *not* using multiview to render to
+/// multiple layers simultaneously.
+///
 /// @param gvr Pointer to the gvr instance from which to get the viewports.
 /// @param viewport_list Pointer to a previously allocated viewport list. This
 ///     will be populated with the recommended buffer viewports and resized if
@@ -340,7 +343,7 @@ void gvr_distort_to_screen(gvr_context* gvr, int32_t texture_id,
                            gvr_clock_time_point target_presentation_time);
 
 /// Queries whether a particular GVR feature is supported by the underlying
-/// platform.
+/// platform.  This should be called after gvr_initialize_gl().
 ///
 /// @param gvr The context to query against.
 /// @param feature The gvr_feature type being queried.
@@ -491,6 +494,13 @@ int32_t gvr_buffer_viewport_get_reprojection(
 void gvr_buffer_viewport_set_reprojection(gvr_buffer_viewport* viewport,
                                           int32_t reprojection);
 
+/// Sets the layer in a multiview buffer from which the viewport should sample.
+///
+/// @param layer_index The layer in the array texture that distortion samples
+///     from.  Must be non-negative.  Defaults to 0.
+void gvr_buffer_viewport_set_source_layer(gvr_buffer_viewport* viewport,
+                                          int32_t layer_index);
+
 /// Compares two gvr_buffer_viewport instances and returns true if they specify
 /// the same view mapping.
 ///
@@ -616,6 +626,17 @@ void gvr_buffer_spec_set_color_format(gvr_buffer_spec* spec,
 ///     Valid formats are in the gvr_depth_stencil_format_type enum.
 void gvr_buffer_spec_set_depth_stencil_format(gvr_buffer_spec* spec,
                                               int32_t depth_stencil_format);
+
+/// Sets the number of layers in a framebuffer backed by an array texture.
+///
+/// Default is 1, which means a non-layered texture will be created.
+/// Not all platforms support multiple layers, so clients can call
+/// gvr_is_feature_supported(GVR_FEATURE_MULTIVIEW) to check.
+///
+/// @param spec Buffer specification.
+/// @param num_layers The number of layers in the array texture.
+void gvr_buffer_spec_set_multiview_layers(gvr_buffer_spec* spec,
+                                          int32_t num_layers);
 
 /// Creates a swap chain from the given buffer specifications.
 /// This is a potentially time-consuming operation. All frames within the
@@ -875,7 +896,7 @@ int32_t gvr_get_viewer_type(const gvr_context* gvr);
 /// the given eye.
 ///
 /// @param gvr Pointer to the gvr instance from which to get the matrix.
-/// @param eye Selected gvr_eye type.
+/// @param eye Selected eye type.
 /// @return Transformation matrix from Head Space to selected Eye Space.
 gvr_mat4f gvr_get_eye_from_head_matrix(const gvr_context* gvr,
                                        const int32_t eye);
@@ -917,6 +938,8 @@ void gvr_compute_distorted_point(const gvr_context* gvr, const int32_t eye,
 #if defined(__cplusplus) && !defined(GVR_NO_CPP_WRAPPER)
 namespace gvr {
 
+class GvrApi;
+
 /// Convenience C++ wrapper for gvr_user_prefs.
 class UserPrefs {
  public:
@@ -944,12 +967,12 @@ class UserPrefs {
   /// Returns the wrapped C object. Does not affect ownership.
   const gvr_user_prefs* cobj() const { return user_prefs_; }
 
+  // Disallow copy and assign.
+  UserPrefs(const UserPrefs&) = delete;
+  void operator=(const UserPrefs&) = delete;
+
  private:
   const gvr_user_prefs* user_prefs_;
-
-  // Disallow copy and assign.
-  UserPrefs(const UserPrefs&);
-  void operator=(const UserPrefs&);
 };
 
 /// Convenience C++ wrapper for the opaque gvr_buffer_viewport type.
@@ -969,6 +992,10 @@ class BufferViewport {
 
   ~BufferViewport() {
     if (viewport_) gvr_buffer_viewport_destroy(&viewport_);
+  }
+
+  explicit operator bool() const {
+    return viewport_ != nullptr;
   }
 
   /// For more information, see gvr_buffer_viewport_get_source_fov().
@@ -1041,6 +1068,11 @@ class BufferViewport {
     gvr_buffer_viewport_set_reprojection(viewport_, reprojection);
   }
 
+  /// For more information, see gvr_buffer_viewport_set_source_layer().
+  void SetSourceLayer(int32_t layer_index) {
+    gvr_buffer_viewport_set_source_layer(viewport_, layer_index);
+  }
+
   /// For more information, see gvr_buffer_viewport_equal().
   bool operator==(const BufferViewport& other) const {
     return gvr_buffer_viewport_equal(viewport_, other.viewport_) ? true : false;
@@ -1052,7 +1084,7 @@ class BufferViewport {
   /// @name Wrapper manipulation
   /// @{
   /// Creates a C++ wrapper for a C object and takes ownership.
-  explicit BufferViewport(gvr_buffer_viewport* viewport)
+  explicit BufferViewport(gvr_buffer_viewport* viewport = nullptr)
       : viewport_(viewport) {}
 
   /// Returns the wrapped C object. Does not affect ownership.
@@ -1084,6 +1116,11 @@ class BufferViewport {
 /// validity is tied to the lifetime of that instance.
 class BufferViewportList {
  public:
+  BufferViewportList()
+      : context_(nullptr),
+        viewport_list_(nullptr)
+  {}
+
   BufferViewportList(BufferViewportList&& other)
       : context_(nullptr), viewport_list_(nullptr) {
     std::swap(context_, other.context_);
@@ -1100,6 +1137,10 @@ class BufferViewportList {
     if (viewport_list_) {
       gvr_buffer_viewport_list_destroy(&viewport_list_);
     }
+  }
+
+  explicit operator bool() const {
+    return viewport_list_ != nullptr;
   }
 
   /// For more information, see gvr_get_recommended_buffer_viewports().
@@ -1119,7 +1160,12 @@ class BufferViewportList {
   }
 
   /// For more information, see gvr_buffer_viewport_list_get_item().
+  /// N.B. If *viewport is an empty BufferViewport object, this
+  /// function will initialize it.
   void GetBufferViewport(size_t index, BufferViewport* viewport) const {
+    if (!*viewport) {
+      *viewport = BufferViewport(context_);
+    }
     gvr_buffer_viewport_list_get_item(viewport_list_, index,
                                       viewport->viewport_);
   }
@@ -1150,6 +1196,10 @@ class BufferViewportList {
   }
   /// @}
 
+  // Disallow copy and assign.
+  BufferViewportList(const BufferViewportList&) = delete;
+  void operator=(const BufferViewportList&) = delete;
+
  private:
   friend class Frame;
   friend class GvrApi;
@@ -1159,12 +1209,8 @@ class BufferViewportList {
       : context_(context),
         viewport_list_(gvr_buffer_viewport_list_create(context)) {}
 
-  const gvr_context* context_;
+  gvr_context* context_;
   gvr_buffer_viewport_list* viewport_list_;
-
-  // Disallow copy and assign.
-  BufferViewportList(const BufferViewportList&) = delete;
-  void operator=(const BufferViewportList&) = delete;
 };
 
 /// Convenience C++ wrapper for gvr_buffer_spec, an opaque pixel buffer
@@ -1183,6 +1229,10 @@ class BufferSpec {
 
   ~BufferSpec() {
     if (spec_) gvr_buffer_spec_destroy(&spec_);
+  }
+
+  explicit operator bool() const {
+    return spec_ != nullptr;
   }
 
   /// Gets the buffer's size. The default value is the recommended render
@@ -1229,10 +1279,15 @@ class BufferSpec {
     gvr_buffer_spec_set_depth_stencil_format(spec_, depth_stencil_format);
   }
 
+  /// For more information, see gvr_buffer_spec_set_multiview_layers().
+  void SetMultiviewLayers(int32_t num_layers) {
+    gvr_buffer_spec_set_multiview_layers(spec_, num_layers);
+  }
+
   /// @name Wrapper manipulation
   /// @{
   /// Creates a C++ wrapper for a C object and takes ownership.
-  explicit BufferSpec(gvr_buffer_spec* spec) : spec_(spec) {}
+  explicit BufferSpec(gvr_buffer_spec* spec = nullptr) : spec_(spec) {}
 
   /// Returns the wrapped C object. Does not affect ownership.
   gvr_buffer_spec* cobj() { return spec_; }
@@ -1275,6 +1330,10 @@ class Frame {
     // The swap chain owns the frame, so no clean-up is required.
   }
 
+  explicit operator bool() const {
+    return frame_ != nullptr;
+  }
+
   /// For more information, see gvr_frame_get_buffer_size().
   Sizei GetBufferSize(int32_t index) const {
     return gvr_frame_get_buffer_size(frame_, index);
@@ -1305,7 +1364,7 @@ class Frame {
   /// @name Wrapper manipulation
   /// @{
   /// Creates a C++ wrapper for a C object and takes ownership.
-  explicit Frame(gvr_frame* frame) : frame_(frame) {}
+  explicit Frame(gvr_frame* frame = nullptr) : frame_(frame) {}
 
   /// Returns the wrapped C object. Does not affect ownership.
   gvr_frame* cobj() { return frame_; }
@@ -1349,6 +1408,10 @@ class SwapChain {
     if (swap_chain_) gvr_swap_chain_destroy(&swap_chain_);
   }
 
+  explicit operator bool() const {
+    return swap_chain_ != nullptr;
+  }
+
   /// For more information, see gvr_swap_chain_get_buffer_count().
   int32_t GetBufferCount() const {
     return gvr_swap_chain_get_buffer_count(swap_chain_);
@@ -1376,7 +1439,8 @@ class SwapChain {
   /// @name Wrapper manipulation
   /// @{
   /// Creates a C++ wrapper for a C object and takes ownership.
-  explicit SwapChain(gvr_swap_chain* swap_chain) : swap_chain_(swap_chain) {}
+  explicit SwapChain(gvr_swap_chain* swap_chain = nullptr)
+      : swap_chain_(swap_chain) {}
 
   /// Returns the wrapped C object. Does not affect ownership.
   gvr_swap_chain* cobj() { return swap_chain_; }
@@ -1391,6 +1455,10 @@ class SwapChain {
   }
   /// @}
 
+  // Disallow copy and assign.
+  SwapChain(const SwapChain&) = delete;
+  void operator=(const SwapChain&) = delete;
+
  private:
   friend class GvrApi;
 
@@ -1403,10 +1471,6 @@ class SwapChain {
   }
 
   gvr_swap_chain* swap_chain_;
-
-  // Disallow copy and assign.
-  SwapChain(const SwapChain&);
-  void operator=(const SwapChain&);
 };
 
 /// This is a convenience C++ wrapper for the Google VR C API.
@@ -1732,16 +1796,16 @@ class GvrApi {
   }
   /// @}
 
+  // Disallow copy and assign.
+  GvrApi(const GvrApi&) = delete;
+  void operator=(const GvrApi&) = delete;
+
  private:
   gvr_context* context_;
 
   // Whether context_ is owned by the GvrApi instance. If owned, the context
   // will be released upon destruction.
   const bool owned_;
-
-  // Disallow copy and assign.
-  GvrApi(const GvrApi&);
-  void operator=(const GvrApi&);
 };
 
 }  // namespace gvr
